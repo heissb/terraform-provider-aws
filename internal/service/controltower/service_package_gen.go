@@ -49,6 +49,11 @@ func (p *servicePackage) SDKDataSources(ctx context.Context) []*inttypes.Service
 func (p *servicePackage) SDKResources(ctx context.Context) []*inttypes.ServicePackageSDKResource {
 	return []*inttypes.ServicePackageSDKResource{
 		{
+			Factory:  resourceBaseline,
+			TypeName: "aws_controltower_baseline",
+			Name:     "Baseline",
+		},
+		{
 			Factory:  resourceControl,
 			TypeName: "aws_controltower_control",
 			Name:     "Control",
