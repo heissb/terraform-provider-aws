@@ -24,6 +24,13 @@ func (p *servicePackage) FrameworkResources(ctx context.Context) []*types.Servic
 			Factory:  newResourceBaseline,
 			TypeName: "aws_controltower_baseline",
 			Name:     "Baseline",
+<<<<<<< HEAD
+=======
+			Tags: unique.Make(inttypes.ServicePackageResourceTags{
+				IdentifierAttribute: names.AttrARN,
+			}),
+			Region: unique.Make(inttypes.ResourceRegionDefault()),
+>>>>>>> b471f837d2f (aws_controltower_baseline: fixup)
 		},
 	}
 }
