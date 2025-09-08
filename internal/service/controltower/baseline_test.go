@@ -20,9 +20,8 @@ import (
 	"github.com/hashicorp/terraform-provider-aws/internal/conns"
 	"github.com/hashicorp/terraform-provider-aws/internal/create"
 	"github.com/hashicorp/terraform-provider-aws/internal/errs"
-	"github.com/hashicorp/terraform-provider-aws/names"
-
 	tfcontroltower "github.com/hashicorp/terraform-provider-aws/internal/service/controltower"
+	"github.com/hashicorp/terraform-provider-aws/names"
 )
 
 func TestAccControlTowerBaseline_basic(t *testing.T) {
@@ -38,7 +37,7 @@ func TestAccControlTowerBaseline_basic(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck: func() {
 			acctest.PreCheck(ctx, t)
-			acctest.PreCheckPartitionHasService(t, names.ControlTowerServiceID)
+			acctest.PreCheckPartitionHasService(t, names.ControlTowerEndpointID)
 			testAccPreCheck(ctx, t)
 		},
 		ErrorCheck:               acctest.ErrorCheck(t, names.ControlTowerServiceID),
@@ -51,13 +50,16 @@ func TestAccControlTowerBaseline_basic(t *testing.T) {
 					testAccCheckBaselineExists(ctx, resourceName, &baseline),
 					resource.TestCheckResourceAttr(resourceName, "baseline_version", "4.0"),
 					resource.TestCheckResourceAttrSet(resourceName, "baseline_identifier"),
-					acctest.MatchResourceAttrRegionalARN(ctx, resourceName, names.AttrARN, "controltower", regexache.MustCompile(`enabledbaseline:+.`)),
+					acctest.MatchResourceAttrRegionalARN(ctx, resourceName, names.AttrARN, "controltower", regexache.MustCompile(`enabledbaseline/+.`)),
 				),
 			},
 			{
-				ResourceName:      resourceName,
-				ImportState:       true,
-				ImportStateVerify: true,
+				ResourceName:                         resourceName,
+				ImportState:                          true,
+				ImportStateIdFunc:                    acctest.AttrImportStateIdFunc(resourceName, names.AttrARN),
+				ImportStateVerify:                    true,
+				ImportStateVerifyIdentifierAttribute: names.AttrARN,
+				ImportStateVerifyIgnore:              []string{names.AttrID},
 			},
 		},
 	})
@@ -76,7 +78,7 @@ func TestAccControlTowerBaseline_disappears(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck: func() {
 			acctest.PreCheck(ctx, t)
-			acctest.PreCheckPartitionHasService(t, names.ControlTowerServiceID)
+			acctest.PreCheckPartitionHasService(t, names.ControlTowerEndpointID)
 			testAccEnabledBaselinesPreCheck(ctx, t)
 		},
 		ErrorCheck:               acctest.ErrorCheck(t, names.ControlTowerServiceID),
@@ -165,6 +167,10 @@ func testAccEnabledBaselinesPreCheck(ctx context.Context, t *testing.T) {
 
 func testAccBaselineConfig_basic(rName string) string {
 	return fmt.Sprintf(`
+data "aws_partition" "current" {}
+data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
+
 data "aws_organizations_organization" "current" {}
 
 resource "aws_organizations_organizational_unit" "test" {
@@ -173,12 +179,12 @@ resource "aws_organizations_organizational_unit" "test" {
 }
 
 resource "aws_controltower_baseline" "test" {
-  baseline_identifier             = "arn:aws:controltower:us-east-1::baseline/3WPD0NA6TJ9AOMU2"
-  baseline_version                = "4.0"
-  target_identifier               = aws_organizations_organizational_unit.test.arn
+  baseline_identifier = "arn:${data.aws_partition.current.id}:controltower:${data.aws_region.current.region}::baseline/17BSJV3IGJ2QSGA2"
+  baseline_version    = "4.0"
+  target_identifier   = aws_organizations_organizational_unit.test.arn
   parameters {
-  key = "IdentityCenterEnabledBaselineArn"
-  value = "arn:aws:controltower:us-east-1:664418989480:enabledbaseline/XALULM96QHI525UOC"
+    key   = "IdentityCenterEnabledBaselineArn"
+    value = "arn:${data.aws_partition.current.id}:controltower:${data.aws_region.current.region}:{data.aws_caller_identity.current.account_id}:enabledbaseline/XALULM96QHI525UOC"
   }
 }
 `, rName)
