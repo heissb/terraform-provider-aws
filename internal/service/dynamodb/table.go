@@ -21,7 +21,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/id"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 	"github.com/hashicorp/terraform-provider-aws/internal/conns"
@@ -93,7 +92,7 @@ func resourceTable() *schema.Resource {
 			func(_ context.Context, diff *schema.ResourceDiff, meta any) error {
 				if diff.Id() != "" && (diff.HasChange("stream_enabled") || (diff.Get("stream_view_type") != "" && diff.HasChange("stream_view_type"))) {
 					if err := diff.SetNewComputed(names.AttrStreamARN); err != nil {
-						return fmt.Errorf("setting stream_arn to computed: %s", err)
+						return fmt.Errorf("setting stream_arn to computed: %w", err)
 					}
 				}
 				return nil
@@ -127,6 +126,7 @@ func resourceTable() *schema.Resource {
 			}),
 			customdiff.ForceNewIfChange("warm_throughput.0.read_units_per_second", func(_ context.Context, old, new, meta any) bool {
 				// warm_throughput can only be increased, not decreased
+				// i.e., "api error ValidationException: One or more parameter values were invalid: Requested ReadUnitsPerSecond for WarmThroughput for table is lower than current WarmThroughput, decreasing WarmThroughput is not supported"
 				if old, new := old.(int), new.(int); new != 0 && new < old {
 					return true
 				}
@@ -135,12 +135,14 @@ func resourceTable() *schema.Resource {
 			}),
 			customdiff.ForceNewIfChange("warm_throughput.0.write_units_per_second", func(_ context.Context, old, new, meta any) bool {
 				// warm_throughput can only be increased, not decreased
+				// i.e., "api error ValidationException: One or more parameter values were invalid: Requested ReadUnitsPerSecond for WarmThroughput for table is lower than current WarmThroughput, decreasing WarmThroughput is not supported"
 				if old, new := old.(int), new.(int); new != 0 && new < old {
 					return true
 				}
 
 				return false
 			}),
+			validateWarmThroughputCustomDiff,
 			validateTTLCustomDiff,
 		),
 
@@ -386,6 +388,11 @@ func resourceTable() *schema.Resource {
 								Default:          awstypes.MultiRegionConsistencyEventual,
 								ValidateDiagFunc: enum.Validate[awstypes.MultiRegionConsistency](),
 							},
+							"deletion_protection_enabled": {
+								Type:     schema.TypeBool,
+								Optional: true,
+								Computed: true,
+							},
 							names.AttrKMSKeyARN: {
 								Type:         schema.TypeString,
 								Optional:     true,
@@ -568,16 +575,16 @@ func warmThroughputSchema() *schema.Schema {
 		Elem: &schema.Resource{
 			Schema: map[string]*schema.Schema{
 				"read_units_per_second": {
-					Type:             schema.TypeInt,
-					Optional:         true,
-					Computed:         true,
-					ValidateDiagFunc: validation.ToDiagFunc(validation.IntAtLeast(12000)),
+					Type:         schema.TypeInt,
+					Optional:     true,
+					Computed:     true,
+					ValidateFunc: validation.IntAtLeast(12000),
 				},
 				"write_units_per_second": {
-					Type:             schema.TypeInt,
-					Optional:         true,
-					Computed:         true,
-					ValidateDiagFunc: validation.ToDiagFunc(validation.IntAtLeast(4000)),
+					Type:         schema.TypeInt,
+					Optional:     true,
+					Computed:     true,
+					ValidateFunc: validation.IntAtLeast(4000),
 				},
 			},
 		},
@@ -658,7 +665,7 @@ func resourceTableCreate(ctx context.Context, d *schema.ResourceData, meta any) 
 			input.SSESpecificationOverride = expandEncryptAtRestOptions(v.([]any))
 		}
 
-		_, err := tfresource.RetryWhen(ctx, createTableTimeout, func() (any, error) {
+		_, err := tfresource.RetryWhen(ctx, createTableTimeout, func(ctx context.Context) (any, error) {
 			return conn.RestoreTableToPointInTime(ctx, input)
 		}, func(err error) (bool, error) {
 			if tfawserr.ErrCodeEquals(err, errCodeThrottlingException) {
@@ -726,7 +733,7 @@ func resourceTableCreate(ctx context.Context, d *schema.ResourceData, meta any) 
 
 		input.TableCreationParameters = tcp
 
-		importTableOutput, err := tfresource.RetryWhen(ctx, createTableTimeout, func() (any, error) {
+		importTableOutput, err := tfresource.RetryWhen(ctx, createTableTimeout, func(ctx context.Context) (any, error) {
 			return conn.ImportTable(ctx, input)
 		}, func(err error) (bool, error) {
 			if tfawserr.ErrCodeEquals(err, errCodeThrottlingException) {
@@ -821,7 +828,7 @@ func resourceTableCreate(ctx context.Context, d *schema.ResourceData, meta any) 
 			input.WarmThroughput = expandWarmThroughput(v.([]any)[0].(map[string]any))
 		}
 
-		_, err := tfresource.RetryWhen(ctx, createTableTimeout, func() (any, error) {
+		_, err := tfresource.RetryWhen(ctx, createTableTimeout, func(ctx context.Context) (any, error) {
 			return conn.CreateTable(ctx, input)
 		}, func(err error) (bool, error) {
 			if tfawserr.ErrCodeEquals(err, errCodeThrottlingException) {
@@ -833,7 +840,6 @@ func resourceTableCreate(ctx context.Context, d *schema.ResourceData, meta any) 
 			if errs.IsAErrorMessageContains[*awstypes.LimitExceededException](err, "indexed tables that can be created simultaneously") {
 				return true, err
 			}
-
 			return false, err
 		})
 
@@ -996,6 +1002,10 @@ func resourceTableRead(ctx context.Context, d *schema.ResourceData, meta any) di
 		d.Set("table_class", awstypes.TableClassStandard)
 	}
 
+	if err := d.Set("warm_throughput", flattenTableWarmThroughput(table.WarmThroughput)); err != nil {
+		return create.AppendDiagSettingError(diags, names.DynamoDB, resNameTable, d.Id(), "warm_throughput", err)
+	}
+
 	describeBackupsInput := dynamodb.DescribeContinuousBackupsInput{
 		TableName: aws.String(d.Id()),
 	}
@@ -1021,10 +1031,6 @@ func resourceTableRead(ctx context.Context, d *schema.ResourceData, meta any) di
 
 	if err := d.Set("ttl", flattenTTL(ttlOut)); err != nil {
 		return create.AppendDiagSettingError(diags, names.DynamoDB, resNameTable, d.Id(), "ttl", err)
-	}
-
-	if err := d.Set("warm_throughput", flattenTableWarmThroughput(table.WarmThroughput)); err != nil {
-		return create.AppendDiagSettingError(diags, names.DynamoDB, resNameTable, d.Id(), "warm_throughput", err)
 	}
 
 	return diags
@@ -1440,11 +1446,11 @@ func cycleStreamEnabled(ctx context.Context, conn *dynamodb.Client, id string, s
 	_, err := conn.UpdateTable(ctx, input)
 
 	if err != nil {
-		return fmt.Errorf("cycling stream enabled: %s", err)
+		return fmt.Errorf("cycling stream enabled: %w", err)
 	}
 
 	if _, err := waitTableActive(ctx, conn, id, timeout); err != nil {
-		return fmt.Errorf("waiting for stream cycle: %s", err)
+		return fmt.Errorf("waiting for stream cycle: %w", err)
 	}
 
 	input.StreamSpecification = &awstypes.StreamSpecification{
@@ -1455,11 +1461,11 @@ func cycleStreamEnabled(ctx context.Context, conn *dynamodb.Client, id string, s
 	_, err = conn.UpdateTable(ctx, input)
 
 	if err != nil {
-		return fmt.Errorf("cycling stream enabled: %s", err)
+		return fmt.Errorf("cycling stream enabled: %w", err)
 	}
 
 	if _, err := waitTableActive(ctx, conn, id, timeout); err != nil {
-		return fmt.Errorf("waiting for stream cycle: %s", err)
+		return fmt.Errorf("waiting for stream cycle: %w", err)
 	}
 
 	return nil
@@ -1530,30 +1536,26 @@ func createReplicas(ctx context.Context, conn *dynamodb.Client, tableName string
 			MultiRegionConsistency: mrscInput,
 		}
 
-		err := retry.RetryContext(ctx, max(replicaUpdateTimeout, timeout), func() *retry.RetryError {
+		err := tfresource.Retry(ctx, max(replicaUpdateTimeout, timeout), func(ctx context.Context) *tfresource.RetryError {
 			_, err := conn.UpdateTable(ctx, input)
 			if err != nil {
 				if tfawserr.ErrCodeEquals(err, errCodeThrottlingException) {
-					return retry.RetryableError(err)
+					return tfresource.RetryableError(err)
 				}
 				if errs.IsAErrorMessageContains[*awstypes.LimitExceededException](err, "can be created.") {
-					return retry.NonRetryableError(err)
+					return tfresource.NonRetryableError(err)
 				}
 				if tfawserr.ErrMessageContains(err, errCodeValidationException, "Replica specified in the Replica Update or Replica Delete action of the request was not found") {
-					return retry.RetryableError(err)
+					return tfresource.RetryableError(err)
 				}
 				if errs.IsA[*awstypes.ResourceInUseException](err) {
-					return retry.RetryableError(err)
+					return tfresource.RetryableError(err)
 				}
 
-				return retry.NonRetryableError(err)
+				return tfresource.NonRetryableError(err)
 			}
 			return nil
 		})
-
-		if tfresource.TimedOut(err) {
-			_, err = conn.UpdateTable(ctx, input)
-		}
 
 		if err != nil {
 			return err
@@ -1627,30 +1629,26 @@ func createReplicas(ctx context.Context, conn *dynamodb.Client, tableName string
 				}
 			}
 
-			err := retry.RetryContext(ctx, max(replicaUpdateTimeout, timeout), func() *retry.RetryError {
+			err := tfresource.Retry(ctx, max(replicaUpdateTimeout, timeout), func(ctx context.Context) *tfresource.RetryError {
 				_, err := conn.UpdateTable(ctx, input)
 				if err != nil {
 					if tfawserr.ErrCodeEquals(err, errCodeThrottlingException) {
-						return retry.RetryableError(err)
+						return tfresource.RetryableError(err)
 					}
 					if errs.IsAErrorMessageContains[*awstypes.LimitExceededException](err, "can be created, updated, or deleted simultaneously") {
-						return retry.RetryableError(err)
+						return tfresource.RetryableError(err)
 					}
 					if tfawserr.ErrMessageContains(err, errCodeValidationException, "Replica specified in the Replica Update or Replica Delete action of the request was not found") {
-						return retry.RetryableError(err)
+						return tfresource.RetryableError(err)
 					}
 					if errs.IsA[*awstypes.ResourceInUseException](err) {
-						return retry.RetryableError(err)
+						return tfresource.RetryableError(err)
 					}
 
-					return retry.NonRetryableError(err)
+					return tfresource.NonRetryableError(err)
 				}
 				return nil
 			})
-
-			if tfresource.TimedOut(err) {
-				_, err = conn.UpdateTable(ctx, input)
-			}
 
 			// An update that doesn't (makes no changes) returns ValidationException
 			// (same region_name and kms_key_arn as currently) throws unhelpfully worded exception:
@@ -1671,6 +1669,12 @@ func createReplicas(ctx context.Context, conn *dynamodb.Client, tableName string
 			// pitr
 			if err = updatePITR(ctx, conn, tableName, tfMap["point_in_time_recovery"].(bool), nil, tfMap["region_name"].(string), timeout); err != nil {
 				return fmt.Errorf("updating replica (%s) point in time recovery: %w", tfMap["region_name"].(string), err)
+			}
+
+			if v, ok := tfMap["deletion_protection_enabled"].(bool); ok {
+				if err = updateReplicaDeletionProtection(ctx, conn, tableName, tfMap["region_name"].(string), v, timeout); err != nil {
+					return fmt.Errorf("updating replica (%s) deletion protection: %w", tfMap["region_name"].(string), err)
+				}
 			}
 		}
 	}
@@ -1755,21 +1759,17 @@ func updatePITR(ctx context.Context, conn *dynamodb.Client, tableName string, en
 	optFn := func(o *dynamodb.Options) {
 		o.Region = region
 	}
-	err := retry.RetryContext(ctx, updateTableContinuousBackupsTimeout, func() *retry.RetryError {
+	err := tfresource.Retry(ctx, updateTableContinuousBackupsTimeout, func(ctx context.Context) *tfresource.RetryError {
 		_, err := conn.UpdateContinuousBackups(ctx, input, optFn)
 		if err != nil {
 			// Backups are still being enabled for this newly created table
 			if errs.IsAErrorMessageContains[*awstypes.ContinuousBackupsUnavailableException](err, "Backups are being enabled") {
-				return retry.RetryableError(err)
+				return tfresource.RetryableError(err)
 			}
-			return retry.NonRetryableError(err)
+			return tfresource.NonRetryableError(err)
 		}
 		return nil
 	})
-
-	if tfresource.TimedOut(err) {
-		_, err = conn.UpdateContinuousBackups(ctx, input, optFn)
-	}
 
 	if err != nil {
 		return fmt.Errorf("updating PITR: %w", err)
@@ -1777,6 +1777,26 @@ func updatePITR(ctx context.Context, conn *dynamodb.Client, tableName string, en
 
 	if _, err := waitPITRUpdated(ctx, conn, tableName, enabled, timeout, optFn); err != nil {
 		return fmt.Errorf("waiting for PITR update: %w", err)
+	}
+
+	return nil
+}
+
+func updateReplicaDeletionProtection(ctx context.Context, conn *dynamodb.Client, tableName, region string, enabled bool, timeout time.Duration) error {
+	log.Printf("[DEBUG] Updating DynamoDB deletion protection to %v (%s)", enabled, region)
+	input := dynamodb.UpdateTableInput{
+		TableName:                 aws.String(tableName),
+		DeletionProtectionEnabled: aws.Bool(enabled),
+	}
+
+	optFn := func(o *dynamodb.Options) { o.Region = region }
+	_, err := conn.UpdateTable(ctx, &input, optFn)
+	if err != nil {
+		return fmt.Errorf("updating deletion protection: %w", err)
+	}
+
+	if _, err := waitReplicaActive(ctx, conn, tableName, region, timeout, replicaPropagationDelay); err != nil {
+		return fmt.Errorf("waiting for deletion protection update: %w", err)
 	}
 
 	return nil
@@ -1865,6 +1885,14 @@ func updateReplica(ctx context.Context, conn *dynamodb.Client, d *schema.Resourc
 				break
 			}
 
+			// just update deletion protection
+			if ma["deletion_protection_enabled"].(bool) != mr["deletion_protection_enabled"].(bool) {
+				if err := updateReplicaDeletionProtection(ctx, conn, d.Id(), ma["region_name"].(string), ma["deletion_protection_enabled"].(bool), d.Timeout(schema.TimeoutUpdate)); err != nil {
+					return fmt.Errorf("updating replica (%s) deletion protection: %w", ma["region_name"].(string), err)
+				}
+				break
+			}
+
 			// nothing changed, assuming propagate_tags changed so do nothing here
 			break
 		}
@@ -1892,7 +1920,7 @@ func updateReplica(ctx context.Context, conn *dynamodb.Client, d *schema.Resourc
 }
 
 func updateWarmThroughput(ctx context.Context, conn *dynamodb.Client, warmList []any, tableName string, timeout time.Duration) error {
-	if len(warmList) < 1 && warmList[0] == nil {
+	if len(warmList) < 1 || warmList[0] == nil {
 		return nil
 	}
 
@@ -1908,11 +1936,11 @@ func updateWarmThroughput(ctx context.Context, conn *dynamodb.Client, warmList [
 	}
 
 	if _, err := waitTableActive(ctx, conn, tableName, timeout); err != nil {
-		return fmt.Errorf("waiting for warm throughput: %s", err)
+		return fmt.Errorf("waiting for warm throughput: %w", err)
 	}
 
 	if err := waitTableWarmThroughputActive(ctx, conn, tableName, timeout); err != nil {
-		return fmt.Errorf("waiting for warm throughput: %s", err)
+		return fmt.Errorf("waiting for warm throughput: %w", err)
 	}
 
 	return nil
@@ -2114,7 +2142,7 @@ func deleteTable(ctx context.Context, conn *dynamodb.Client, tableName string) e
 		TableName: aws.String(tableName),
 	}
 
-	_, err := tfresource.RetryWhen(ctx, deleteTableTimeout, func() (any, error) {
+	_, err := tfresource.RetryWhen(ctx, deleteTableTimeout, func(ctx context.Context) (any, error) {
 		return conn.DeleteTable(ctx, input)
 	}, func(err error) (bool, error) {
 		// Subscriber limit exceeded: Only 10 tables can be created, updated, or deleted simultaneously
@@ -2175,35 +2203,31 @@ func deleteReplicas(ctx context.Context, conn *dynamodb.Client, tableName string
 			TableName:      aws.String(tableName),
 			ReplicaUpdates: replicaDeletes,
 		}
-		err := retry.RetryContext(ctx, updateTableTimeout, func() *retry.RetryError {
+		err := tfresource.Retry(ctx, updateTableTimeout, func(ctx context.Context) *tfresource.RetryError {
 			_, err := conn.UpdateTable(ctx, input)
 			notFoundRetries := 0
 			if err != nil {
 				if tfawserr.ErrCodeEquals(err, errCodeThrottlingException) {
-					return retry.RetryableError(err)
+					return tfresource.RetryableError(err)
 				}
 				if errs.IsA[*awstypes.ResourceNotFoundException](err) {
 					notFoundRetries++
 					if notFoundRetries > 3 {
-						return retry.NonRetryableError(err)
+						return tfresource.NonRetryableError(err)
 					}
-					return retry.RetryableError(err)
+					return tfresource.RetryableError(err)
 				}
 				if errs.IsAErrorMessageContains[*awstypes.LimitExceededException](err, "can be created, updated, or deleted simultaneously") {
-					return retry.RetryableError(err)
+					return tfresource.RetryableError(err)
 				}
 				if errs.IsA[*awstypes.ResourceInUseException](err) {
-					return retry.RetryableError(err)
+					return tfresource.RetryableError(err)
 				}
 
-				return retry.NonRetryableError(err)
+				return tfresource.NonRetryableError(err)
 			}
 			return nil
 		})
-
-		if tfresource.TimedOut(err) {
-			_, err = conn.UpdateTable(ctx, input)
-		}
 
 		if err != nil && !errs.IsA[*awstypes.ResourceNotFoundException](err) {
 			return fmt.Errorf("deleting replica(s): %w", err)
@@ -2250,35 +2274,31 @@ func deleteReplicas(ctx context.Context, conn *dynamodb.Client, tableName string
 					},
 				}
 
-				err := retry.RetryContext(ctx, updateTableTimeout, func() *retry.RetryError {
+				err := tfresource.Retry(ctx, updateTableTimeout, func(ctx context.Context) *tfresource.RetryError {
 					_, err := conn.UpdateTable(ctx, input)
 					notFoundRetries := 0
 					if err != nil {
 						if tfawserr.ErrCodeEquals(err, errCodeThrottlingException) {
-							return retry.RetryableError(err)
+							return tfresource.RetryableError(err)
 						}
 						if errs.IsA[*awstypes.ResourceNotFoundException](err) {
 							notFoundRetries++
 							if notFoundRetries > 3 {
-								return retry.NonRetryableError(err)
+								return tfresource.NonRetryableError(err)
 							}
-							return retry.RetryableError(err)
+							return tfresource.RetryableError(err)
 						}
 						if errs.IsAErrorMessageContains[*awstypes.LimitExceededException](err, "can be created, updated, or deleted simultaneously") {
-							return retry.RetryableError(err)
+							return tfresource.RetryableError(err)
 						}
 						if errs.IsA[*awstypes.ResourceInUseException](err) {
-							return retry.RetryableError(err)
+							return tfresource.RetryableError(err)
 						}
 
-						return retry.NonRetryableError(err)
+						return tfresource.NonRetryableError(err)
 					}
 					return nil
 				})
-
-				if tfresource.TimedOut(err) {
-					_, err = conn.UpdateTable(ctx, input)
-				}
 
 				if err != nil && !errs.IsA[*awstypes.ResourceNotFoundException](err) {
 					return fmt.Errorf("deleting replica (%s): %w", regionName, err)
@@ -2368,7 +2388,7 @@ func enrichReplicas(ctx context.Context, conn *dynamodb.Client, arn, tableName s
 
 		newARN, err := arnForNewRegion(arn, tfMap["region_name"].(string))
 		if err != nil {
-			return nil, fmt.Errorf("creating new-region ARN: %s", err)
+			return nil, fmt.Errorf("creating new-region ARN: %w", err)
 		}
 		tfMap[names.AttrARN] = newARN
 
@@ -2381,12 +2401,12 @@ func enrichReplicas(ctx context.Context, conn *dynamodb.Client, arn, tableName s
 			continue
 		}
 
-		tfMap[names.AttrStreamARN] = aws.ToString(table.LatestStreamArn)
-		tfMap["stream_label"] = aws.ToString(table.LatestStreamLabel)
-
+		tfMap["deletion_protection_enabled"] = aws.ToBool(table.DeletionProtectionEnabled)
 		if table.SSEDescription != nil {
 			tfMap[names.AttrKMSKeyARN] = aws.ToString(table.SSEDescription.KMSMasterKeyArn)
 		}
+		tfMap[names.AttrStreamARN] = aws.ToString(table.LatestStreamArn)
+		tfMap["stream_label"] = aws.ToString(table.LatestStreamLabel)
 
 		tfList[i] = tfMap
 	}
@@ -2623,6 +2643,16 @@ func flattenTableWarmThroughput(apiObject *awstypes.TableWarmThroughputDescripti
 		return []any{}
 	}
 
+	// AWS may return values below the minimum when warm throughput is not actually configured
+	// Also treat exact minimum values as defaults since AWS sets these automatically
+	readUnits := aws.ToInt64(apiObject.ReadUnitsPerSecond)
+	writeUnits := aws.ToInt64(apiObject.WriteUnitsPerSecond)
+
+	// Return empty if values are below minimums OR exactly at minimums (AWS defaults)
+	if (readUnits < 12000 && writeUnits < 4000) || (readUnits == 12000 && writeUnits == 4000) {
+		return []any{}
+	}
+
 	m := map[string]any{}
 
 	if v := apiObject.ReadUnitsPerSecond; v != nil {
@@ -2638,6 +2668,16 @@ func flattenTableWarmThroughput(apiObject *awstypes.TableWarmThroughputDescripti
 
 func flattenGSIWarmThroughput(apiObject *awstypes.GlobalSecondaryIndexWarmThroughputDescription) []any {
 	if apiObject == nil {
+		return []any{}
+	}
+
+	// AWS may return values below the minimum when warm throughput is not actually configured
+	// Also treat exact minimum values as defaults since AWS sets these automatically
+	readUnits := aws.ToInt64(apiObject.ReadUnitsPerSecond)
+	writeUnits := aws.ToInt64(apiObject.WriteUnitsPerSecond)
+
+	// Return empty if values are below minimums OR exactly at minimums (AWS defaults)
+	if (readUnits < 12000 && writeUnits < 4000) || (readUnits == 12000 && writeUnits == 4000) {
 		return []any{}
 	}
 
@@ -3060,6 +3100,65 @@ func validateProvisionedThroughputField(diff *schema.ResourceDiff, key string) e
 			return fmt.Errorf("%s can not be set when billing_mode is %q", key, awstypes.BillingModePayPerRequest)
 		}
 	}
+	return nil
+}
+
+func validateWarmThroughputCustomDiff(ctx context.Context, d *schema.ResourceDiff, meta any) error {
+	configRaw := d.GetRawConfig()
+	if !configRaw.IsKnown() || configRaw.IsNull() {
+		return nil
+	}
+
+	// Handle table-level warm throughput suppression
+	if err := suppressTableWarmThroughputDefaults(d, configRaw); err != nil {
+		return err
+	}
+
+	// Handle GSI warm throughput suppression
+	if err := suppressGSIWarmThroughputDefaults(d, configRaw); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func suppressTableWarmThroughputDefaults(d *schema.ResourceDiff, configRaw cty.Value) error {
+	// If warm throughput is explicitly configured, don't suppress any diffs
+	if warmThroughput := configRaw.GetAttr("warm_throughput"); warmThroughput.IsKnown() && !warmThroughput.IsNull() && warmThroughput.LengthInt() > 0 {
+		return nil
+	}
+
+	// If warm throughput is not explicitly configured, suppress AWS default values
+	if !d.HasChange("warm_throughput") {
+		return nil
+	}
+
+	_, new := d.GetChange("warm_throughput")
+	newList, ok := new.([]any)
+	if !ok || len(newList) == 0 {
+		return nil
+	}
+
+	newMap, ok := newList[0].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	readUnits := newMap["read_units_per_second"]
+	writeUnits := newMap["write_units_per_second"]
+
+	// If AWS returns default values and no explicit config, suppress the diff
+	if (readUnits == 1 && writeUnits == 1) || (readUnits == 12000 && writeUnits == 4000) {
+		return d.Clear("warm_throughput")
+	}
+
+	return nil
+}
+
+func suppressGSIWarmThroughputDefaults(d *schema.ResourceDiff, configRaw cty.Value) error {
+	// GSI warm throughput defaults are now handled in the flattenGSIWarmThroughput function
+	// by filtering out AWS default values during the read operation.
+	// This approach is more reliable than trying to suppress diffs on Set-based fields.
 	return nil
 }
 

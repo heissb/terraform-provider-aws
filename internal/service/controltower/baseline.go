@@ -6,6 +6,7 @@ package controltower
 import (
 	"context"
 	"errors"
+	"reflect"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -14,6 +15,7 @@ import (
 	awstypes "github.com/aws/aws-sdk-go-v2/service/controltower/types"
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -36,10 +38,8 @@ import (
 
 // @FrameworkResource("aws_controltower_baseline", name="Baseline")
 // @Tags(identifierAttribute="arn")
-// @ArnIdentity
 func newResourceBaseline(_ context.Context) (resource.ResourceWithConfigure, error) {
 	r := &resourceBaseline{}
-
 	r.SetDefaultCreateTimeout(30 * time.Minute)
 	r.SetDefaultUpdateTimeout(30 * time.Minute)
 	r.SetDefaultDeleteTimeout(30 * time.Minute)
@@ -54,9 +54,7 @@ const (
 type resourceBaseline struct {
 	framework.ResourceWithModel[resourceBaselineData]
 	framework.WithTimeouts
-	framework.WithImportByIdentity
 }
-
 
 func (r *resourceBaseline) Schema(ctx context.Context, _ resource.SchemaRequest, response *resource.SchemaResponse) {
 	response.Schema = schema.Schema{
@@ -76,6 +74,9 @@ func (r *resourceBaseline) Schema(ctx context.Context, _ resource.SchemaRequest,
 			},
 			"operation_identifier": schema.StringAttribute{
 				Computed: true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			names.AttrTags:    tftags.TagsAttribute(),
 			names.AttrTagsAll: tftags.TagsAttributeComputedOnly(),
@@ -88,7 +89,7 @@ func (r *resourceBaseline) Schema(ctx context.Context, _ resource.SchemaRequest,
 		},
 		Blocks: map[string]schema.Block{
 			names.AttrParameters: schema.ListNestedBlock{
-				CustomType: fwtypes.NewListNestedObjectTypeOf[parameters](ctx),
+				CustomType: fwtypes.NewListNestedObjectTypeOf[parameter](ctx),
 				Validators: []validator.List{
 					listvalidator.SizeAtMost(1),
 				},
@@ -98,7 +99,6 @@ func (r *resourceBaseline) Schema(ctx context.Context, _ resource.SchemaRequest,
 							Required: true,
 						},
 						names.AttrValue: schema.StringAttribute{
-							//CustomType: fwtypes.NewSmithyJSONType(ctx, document.NewLazyDocument),
 							Required: true,
 						},
 					},
@@ -123,28 +123,12 @@ func (r *resourceBaseline) Create(ctx context.Context, request resource.CreateRe
 	}
 
 	in := controltower.EnableBaselineInput{}
-
 	response.Diagnostics.Append(fwflex.Expand(ctx, plan, &in)...)
 	if response.Diagnostics.HasError() {
 		return
 	}
 
 	in.Tags = getTagsIn(ctx)
-
-	params, d := plan.Parameters.ToSlice(ctx)
-	response.Diagnostics.Append(d...)
-	if response.Diagnostics.HasError() {
-		return
-	}
-
-	var ebp []awstypes.EnabledBaselineParameter
-	for _, param := range params {
-		ebp = append(ebp, awstypes.EnabledBaselineParameter{
-			Key:   param.Key.ValueStringPointer(),
-			Value: document.NewLazyDocument(param.Value.String()),
-		})
-	}
-	in.Parameters = ebp
 
 	out, err := conn.EnableBaseline(ctx, &in)
 	if err != nil {
@@ -212,30 +196,6 @@ func (r *resourceBaseline) Read(ctx context.Context, request resource.ReadReques
 		return
 	}
 
-	if out.Parameters != nil {
-		var parameterList []parameters
-		for _, param := range out.Parameters {
-			var data any
-			err = param.Value.UnmarshalSmithyDocument(data)
-			if err != nil {
-				response.Diagnostics.AddError(
-					create.ProblemStandardMessage(names.ControlTower, create.ErrActionSetting, ResNameBaseline, state.ARN.String(), err),
-					err.Error(),
-				)
-				return
-			}
-
-			p := parameters{
-				Key:   fwflex.StringToFramework(ctx, param.Key),
-				Value: fwflex.StringValueToFramework(ctx, data.(string)),
-			}
-			parameterList = append(parameterList, p)
-		}
-		state.Parameters = fwtypes.NewListNestedObjectValueOfValueSliceMust(ctx, parameterList)
-	} else {
-		state.Parameters = fwtypes.NewListNestedObjectValueOfNull[parameters](ctx)
-	}
-
 	response.Diagnostics.Append(response.State.Set(ctx, &state)...)
 }
 
@@ -255,7 +215,7 @@ func (r *resourceBaseline) Update(ctx context.Context, request resource.UpdateRe
 		return
 	}
 
-	if !diff.HasChanges() {
+	if diff.HasChanges() {
 		in := controltower.UpdateEnabledBaselineInput{
 			EnabledBaselineIdentifier: plan.ARN.ValueStringPointer(),
 		}
@@ -285,7 +245,6 @@ func (r *resourceBaseline) Update(ctx context.Context, request resource.UpdateRe
 		updateTimeout := r.UpdateTimeout(ctx, plan.Timeouts)
 		_, err = waitBaselineReady(ctx, conn, plan.ARN.ValueString(), updateTimeout)
 		if err != nil {
-			response.Diagnostics.Append(response.State.SetAttribute(ctx, path.Root(names.AttrARN), plan.ARN.ValueString())...)
 			response.Diagnostics.AddError(
 				create.ProblemStandardMessage(names.ControlTower, create.ErrActionWaitingForUpdate, ResNameBaseline, plan.ARN.String(), err),
 				err.Error(),
@@ -327,12 +286,43 @@ func (r *resourceBaseline) Delete(ctx context.Context, request resource.DeleteRe
 		return
 	}
 
+	deleteTimeout := r.UpdateTimeout(ctx, state.Timeouts)
+	_, err = waitBaselineDeleted(ctx, conn, state.ARN.ValueString(), deleteTimeout)
+	if err != nil {
+		response.Diagnostics.AddError(
+			create.ProblemStandardMessage(names.ControlTower, create.ErrActionWaitingForDeletion, ResNameBaseline, state.ARN.String(), err),
+			err.Error(),
+		)
+		return
+	}
 }
 
-func waitBaselineReady(ctx context.Context, conn *controltower.Client, id string, timeout time.Duration) (*awstypes.EnabledBaselineDetails, error) {
+func (r *resourceBaseline) ImportState(ctx context.Context, request resource.ImportStateRequest, response *resource.ImportStateResponse) {
+	resource.ImportStatePassthroughID(ctx, path.Root(names.AttrARN), request, response)
+}
+
+func waitBaselineReady(ctx context.Context, conn *controltower.Client, id string, timeout time.Duration) (*awstypes.EnabledBaselineDetails, error) { //nolint:unparam
 	stateConf := &retry.StateChangeConf{
 		Pending:                   enum.Slice(awstypes.EnablementStatusUnderChange),
 		Target:                    enum.Slice(awstypes.EnablementStatusSucceeded),
+		Refresh:                   statusBaseline(conn, id),
+		Timeout:                   timeout,
+		NotFoundChecks:            20,
+		ContinuousTargetOccurence: 2,
+	}
+
+	outputRaw, err := stateConf.WaitForStateContext(ctx)
+	if out, ok := outputRaw.(*awstypes.EnabledBaselineDetails); ok {
+		return out, err
+	}
+
+	return nil, err
+}
+
+func waitBaselineDeleted(ctx context.Context, conn *controltower.Client, id string, timeout time.Duration) (*awstypes.EnabledBaselineDetails, error) { //nolint:unparam
+	stateConf := &retry.StateChangeConf{
+		Pending:                   enum.Slice(awstypes.EnablementStatusUnderChange),
+		Target:                    []string{},
 		Refresh:                   statusBaseline(conn, id),
 		Timeout:                   timeout,
 		NotFoundChecks:            20,
@@ -387,18 +377,62 @@ func findBaselineByID(ctx context.Context, conn *controltower.Client, id string)
 
 type resourceBaselineData struct {
 	framework.WithRegionModel
-	ARN                 types.String                                `tfsdk:"arn"`
-	BaselineIdentifier  types.String                                `tfsdk:"baseline_identifier"`
-	BaselineVersion     types.String                                `tfsdk:"baseline_version"`
-	OperationIdentifier types.String                                `tfsdk:"operation_identifier"`
-	Parameters          fwtypes.ListNestedObjectValueOf[parameters] `tfsdk:"parameters"`
-	Tags                tftags.Map                                  `tfsdk:"tags"`
-	TagsAll             tftags.Map                                  `tfsdk:"tags_all"`
-	TargetIdentifier    types.String                                `tfsdk:"target_identifier"`
-	Timeouts            timeouts.Value                              `tfsdk:"timeouts"`
+	ARN                 types.String                               `tfsdk:"arn"`
+	BaselineIdentifier  types.String                               `tfsdk:"baseline_identifier"`
+	BaselineVersion     types.String                               `tfsdk:"baseline_version"`
+	OperationIdentifier types.String                               `tfsdk:"operation_identifier"`
+	Parameters          fwtypes.ListNestedObjectValueOf[parameter] `tfsdk:"parameters"`
+	Tags                tftags.Map                                 `tfsdk:"tags"`
+	TagsAll             tftags.Map                                 `tfsdk:"tags_all"`
+	TargetIdentifier    types.String                               `tfsdk:"target_identifier"`
+	Timeouts            timeouts.Value                             `tfsdk:"timeouts"`
 }
 
-type parameters struct {
+type parameter struct {
 	Key   types.String `tfsdk:"key"`
 	Value types.String `tfsdk:"value"`
+}
+
+func (p *parameter) Flatten(ctx context.Context, v any) diag.Diagnostics {
+	var diags diag.Diagnostics
+
+	switch param := v.(type) {
+	case awstypes.EnabledBaselineParameterSummary:
+		p.Key = fwflex.StringToFramework(ctx, param.Key)
+		if param.Value != nil {
+			var value string
+			err := param.Value.UnmarshalSmithyDocument(&value)
+			if err != nil {
+				diags.AddError(
+					"Error Reading Control Tower Baseline Parameter",
+					"Could not read Control Tower Baseline Parameter: "+err.Error(),
+				)
+				return diags
+			}
+
+			p.Value = fwflex.StringValueToFramework(ctx, value)
+		} else {
+			p.Value = types.StringNull()
+		}
+	}
+	return diags
+}
+
+func (p parameter) ExpandTo(ctx context.Context, targetType reflect.Type) (any, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	switch targetType {
+	case reflect.TypeOf(awstypes.EnabledBaselineParameter{}):
+		var r awstypes.EnabledBaselineParameter
+		if !p.Key.IsNull() {
+			r.Key = fwflex.StringFromFramework(ctx, p.Key)
+		}
+
+		if !p.Value.IsNull() {
+			r.Value = document.NewLazyDocument(fwflex.StringValueFromFramework(ctx, p.Value))
+		}
+
+		return &r, diags
+	}
+
+	return nil, diags
 }

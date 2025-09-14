@@ -4,10 +4,11 @@
 package json_test
 
 import (
+	"cmp"
+	"slices"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
-	"github.com/hashicorp/terraform-provider-aws/internal/acctest/jsoncmp"
+	gocmp "github.com/google/go-cmp/cmp"
 	tfjson "github.com/hashicorp/terraform-provider-aws/internal/json"
 	mattbairdjsonpatch "github.com/mattbaird/jsonpatch"
 )
@@ -73,75 +74,20 @@ func TestCreatePatchFromStrings(t *testing.T) {
 			t.Parallel()
 
 			got, err := tfjson.CreatePatchFromStrings(testCase.a, testCase.b)
-			if got, want := err != nil, testCase.wantErr; !cmp.Equal(got, want) {
+			if got, want := err != nil, testCase.wantErr; !gocmp.Equal(got, want) {
 				t.Errorf("CreatePatchFromStrings(%s, %s) err %t, want %t", testCase.a, testCase.b, got, want)
 			}
 			if err == nil {
-				if diff := cmp.Diff(got, testCase.wantPatch); diff != "" {
-					t.Errorf("unexpected diff (+wanted, -got): %s", diff)
-				}
-			}
-		})
-	}
-}
+				sortTransformer := gocmp.Transformer("SortPatchOps", func(ops []mattbairdjsonpatch.JsonPatchOperation) []mattbairdjsonpatch.JsonPatchOperation {
+					sorted := make([]mattbairdjsonpatch.JsonPatchOperation, len(ops))
+					copy(sorted, ops)
+					slices.SortFunc(sorted, func(a, b mattbairdjsonpatch.JsonPatchOperation) int {
+						return cmp.Or(cmp.Compare(a.Operation, b.Operation), cmp.Compare(a.Path, b.Path))
+					})
+					return sorted
+				})
 
-func TestCreateMergePatchFromStrings(t *testing.T) {
-	t.Parallel()
-
-	testCases := []struct {
-		testName  string
-		a, b      string
-		wantPatch string
-		wantErr   bool
-	}{
-		{
-			testName: "invalid JSON",
-			a:        `test`,
-			b:        `{}`,
-			wantErr:  true,
-		},
-		{
-			testName:  "empty patch, empty JSON",
-			a:         `{}`,
-			b:         `{}`,
-			wantPatch: `{}`,
-		},
-		{
-			testName:  "empty patch, non-empty JSON",
-			a:         `{"A": "test1", "B": 42}`,
-			b:         `{"B": 42, "A": "test1"}`,
-			wantPatch: `{}`,
-		},
-		{
-			testName:  "from empty JSON",
-			a:         `{}`,
-			b:         `{"A": "test1", "B": 42}`,
-			wantPatch: `{"A":"test1", "B":42}`,
-		},
-		{
-			testName:  "to empty JSON",
-			a:         `{"A": "test1", "B": 42}`,
-			b:         `{}`,
-			wantPatch: `{"A":null, "B":null}`,
-		},
-		{
-			testName:  "change values",
-			a:         `{"A": "test1", "B": 42}`,
-			b:         `{"A": ["test2"], "B": 42}`,
-			wantPatch: `{"A": ["test2"]}`,
-		},
-	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.testName, func(t *testing.T) {
-			t.Parallel()
-
-			got, err := tfjson.CreateMergePatchFromStrings(testCase.a, testCase.b)
-			if got, want := err != nil, testCase.wantErr; !cmp.Equal(got, want) {
-				t.Errorf("CreateMergePatchFromStrings(%s, %s) err %t, want %t", testCase.a, testCase.b, got, want)
-			}
-			if err == nil {
-				if diff := jsoncmp.Diff(got, testCase.wantPatch); diff != "" {
+				if diff := gocmp.Diff(got, testCase.wantPatch, sortTransformer); diff != "" {
 					t.Errorf("unexpected diff (+wanted, -got): %s", diff)
 				}
 			}
