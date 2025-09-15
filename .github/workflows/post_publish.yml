@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Tidy Jira
-        uses: breathingdust/github-jira-tidy@b503407f09af5564fd806924bdf4495510d848b6 # v0.10.0
+        uses: breathingdust/github-jira-tidy@302d16f9cc705ea132dc20c34d1cff6a98b03509 # v0.15.0
         with:
           jira_host: 'hashicorp.atlassian.net'
           jira_username: 'sdavis@hashicorp.com'
